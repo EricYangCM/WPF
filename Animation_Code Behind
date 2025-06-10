@@ -1,0 +1,28 @@
+** 이미지 이동 
+1. XAML 에서 Canvas안에 이미지 넣기
+
+<Canvas x:Name="mainCanvas" Width="800" Height="600" Background="LightGray">
+    <Image x:Name="img1" Width="100" Height="100" Source="img1.png" Canvas.Left="0" Canvas.Top="0"/>
+</Canvas>
+
+
+2. 함수 사용
+
+private void MoveImageTo(double x, double y)
+{
+    var animX = new DoubleAnimation
+    {
+        To = x,
+        Duration = TimeSpan.FromSeconds(1)
+    };
+
+    var animY = new DoubleAnimation
+    {
+        To = y,
+        Duration = TimeSpan.FromSeconds(1)
+    };
+
+    img1.BeginAnimation(Canvas.LeftProperty, animX);
+    img1.BeginAnimation(Canvas.TopProperty, animY);
+}
+
