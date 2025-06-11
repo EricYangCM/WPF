@@ -1,3 +1,6 @@
+*** NUGET 에서 Fleck 추가하기 ***
+
+
 using Fleck;
 using System;
 using System.Collections.Generic;
