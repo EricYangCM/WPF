@@ -1,0 +1,184 @@
+using System;
+using System.Collections.Generic;
+using System.IO.Ports;
+using System.Text;
+using System.Timers;
+
+namespace NFS_LightingCtrlSystem_v1
+{
+    public class CnetReadResult
+    {
+        public ushort Address { get; set; }
+        public string Area { get; set; } = "M";
+        public bool[] Values { get; set; }
+        public byte[] RawFrame { get; set; }
+    }
+
+    public class Cnet
+    {
+        private SerialPort _serialPort;
+        private List<byte> _rxBuffer = new List<byte>();
+        private bool _awaitingResponse = false;
+        private Queue<byte[]> _sendQueue = new Queue<byte[]>();
+        private object _lock = new object();
+        private Timer _healthTimer = new Timer(3000);
+        private bool _isConnected = false;
+
+        public string PortName { get; set; }
+        public int BaudRate { get; set; } = 9600;
+        public event Action<CnetReadResult> OnReadComplete;
+        public event Action<string> OnError;
+        public event Action<bool> OnConnectionChanged;
+
+        public bool Start()
+        {
+            try
+            {
+                _serialPort = new SerialPort(PortName, BaudRate, Parity.Even, 7, StopBits.One);
+                _serialPort.DataReceived += SerialPort_DataReceived;
+                _serialPort.Open();
+                _isConnected = true;
+                _healthTimer.Elapsed += HealthTimer_Elapsed;
+                _healthTimer.Start();
+                OnConnectionChanged?.Invoke(true);
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        public void Stop()
+        {
+            _healthTimer.Stop();
+            if (_serialPort?.IsOpen == true)
+                _serialPort.Close();
+            _isConnected = false;
+            lock (_lock) _sendQueue.Clear();
+            OnConnectionChanged?.Invoke(false);
+        }
+
+        private void HealthTimer_Elapsed(object sender, ElapsedEventArgs e)
+        {
+            if (_serialPort?.IsOpen != true)
+            {
+                if (_isConnected)
+                {
+                    _isConnected = false;
+                    lock (_lock) _sendQueue.Clear();
+                    OnConnectionChanged?.Invoke(false);
+                }
+            }
+        }
+
+        public void ReadM(ushort address, ushort count, byte station = 0x10)
+        {
+            if (!_isConnected) return;
+
+            string addrStr = "%MW" + address.ToString("D3"); // 예: %MW100
+            string countStr = count.ToString("D2");          // 예: 05
+
+            List<byte> frame = new List<byte>();
+
+            frame.Add(0x05); // ENQ
+
+            // 순서: 국번, 명령어, 명령어 타입, 변수 길이, 변수 이름, 데이터 개수
+            frame.AddRange(Encoding.ASCII.GetBytes(station.ToString("D2"))); // 국번 ("10")
+            frame.AddRange(Encoding.ASCII.GetBytes("R"));                     // 명령어
+            frame.AddRange(Encoding.ASCII.GetBytes("SB"));                   // 명령어 타입
+            frame.AddRange(Encoding.ASCII.GetBytes("06"));                   // 변수 이름 길이 (%MWxxx → 6자리)
+            frame.AddRange(Encoding.ASCII.GetBytes(addrStr));                // 변수 이름
+            frame.AddRange(Encoding.ASCII.GetBytes(countStr));               // 데이터 개수
+
+            frame.Add(0x04); // EOT
+
+            // BCC 계산 (ENQ 제외한 index 1부터 끝까지)
+            byte bcc = CalculateBCC(frame.ToArray(), 1);
+            frame.Add(bcc);
+
+            lock (_lock)
+            {
+                _sendQueue.Enqueue(frame.ToArray());
+                if (!_awaitingResponse)
+                    SendNext();
+            }
+        }
+
+
+        private void SendNext()
+        {
+            lock (_lock)
+            {
+                if (_sendQueue.Count > 0 && _serialPort.IsOpen)
+                {
+                    byte[] data = _sendQueue.Dequeue();
+                    _rxBuffer.Clear();
+                    _serialPort.Write(data, 0, data.Length);
+                    _awaitingResponse = true;
+                    System.Threading.Tasks.Task.Delay(300).ContinueWith(_ =>
+                    {
+                        if (_awaitingResponse)
+                        {
+                            _awaitingResponse = false;
+                            OnError?.Invoke("Timeout");
+                            SendNext();
+                        }
+                    });
+                }
+            }
+        }
+
+        private byte CalculateBCC(byte[] data, int startIndex)
+        {
+            byte bcc = 0;
+            for (int i = startIndex; i < data.Length; i++)
+                bcc ^= data[i];
+            return bcc;
+        }
+
+        private void SerialPort_DataReceived(object sender, SerialDataReceivedEventArgs e)
+        {
+            int count = _serialPort.BytesToRead;
+            byte[] buffer = new byte[count];
+            _serialPort.Read(buffer, 0, count);
+            _rxBuffer.AddRange(buffer);
+
+            if (_rxBuffer.Count >= 1 && _rxBuffer[0] == 0x15) // NAK
+            {
+                if (_rxBuffer.Count >= 6)
+                {
+                    string err = Encoding.ASCII.GetString(_rxBuffer.GetRange(2, 4).ToArray());
+                    OnError?.Invoke($"NAK: {err}");
+                    _awaitingResponse = false;
+                    SendNext();
+                }
+                return;
+            }
+
+            if (_rxBuffer.Count >= 1 && _rxBuffer[0] == 0x06) // ACK
+            {
+                int etxIndex = _rxBuffer.FindIndex(1, b => b == 0x03);
+                if (etxIndex > 0 && _rxBuffer.Count > etxIndex + 1)
+                {
+                    var dataBytes = _rxBuffer.GetRange(1, etxIndex - 1);
+                    string rawData = Encoding.ASCII.GetString(dataBytes.ToArray());
+                    bool[] values = new bool[rawData.Length];
+                    for (int i = 0; i < rawData.Length; i++)
+                        values[i] = rawData[i] == '1';
+
+                    OnReadComplete?.Invoke(new CnetReadResult
+                    {
+                        Address = 0, // TODO: 요청 시 저장 필요
+                        Area = "M",
+                        Values = values,
+                        RawFrame = _rxBuffer.ToArray()
+                    });
+
+                    _awaitingResponse = false;
+                    SendNext();
+                }
+            }
+        }
+    }
+}
